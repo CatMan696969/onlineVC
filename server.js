@@ -15,77 +15,87 @@ const io = new Server(server, {
   }
 });
 
-// health check (VERY IMPORTANT for Render)
 app.get("/ping", (req, res) => {
-  res.send("pong");
+  res.send("ok");
 });
 
-let waitingUser = null;
+let waiting = null;
 
+// ---------------- CONNECTION ----------------
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // FIND MATCH
-  socket.on("find", () => {
-    console.log("find request:", socket.id);
+  socket.meta = {};
+  socket.partnerId = null;
 
-    if (waitingUser === null) {
-      waitingUser = socket;
-      console.log("waiting:", socket.id);
-    } else {
-      const partner = waitingUser;
+  // ---------------- FIND MATCH ----------------
+  socket.on("find", (meta) => {
+    socket.meta = meta || {};
 
-      if (partner.id === socket.id) return;
+    console.log("find:", socket.id, socket.meta);
 
-      waitingUser = null;
-
-      // store partner info
-      socket.partnerId = partner.id;
-      partner.partnerId = socket.id;
-
-      console.log("MATCH:", socket.id, partner.id);
-
-      // 🔥 IMPORTANT: ALWAYS send DATA (never undefined)
-      socket.emit("matched", {
-        offerer: true,
-        partnerId: partner.id
-      });
-
-      partner.emit("matched", {
-        offerer: false,
-        partnerId: socket.id
-      });
+    if (!waiting) {
+      waiting = socket;
+      return;
     }
+
+    if (waiting.id === socket.id) return;
+
+    const partner = waiting;
+    waiting = null;
+
+    socket.partnerId = partner.id;
+    partner.partnerId = socket.id;
+
+    console.log("MATCH:", socket.id, partner.id);
+
+    // send match info
+    socket.emit("matched", {
+      offerer: true,
+      partnerMeta: partner.meta
+    });
+
+    partner.emit("matched", {
+      offerer: false,
+      partnerMeta: socket.meta
+    });
   });
 
-  // SIGNALING (WebRTC exchange)
+  // ---------------- SIGNALING (WEBRTC) ----------------
   socket.on("signal", (data) => {
     if (!socket.partnerId) return;
 
     io.to(socket.partnerId).emit("signal", data);
   });
 
-  // NEXT USER
-  socket.on("next", () => {
-    console.log("next:", socket.id);
+  // ---------------- CHAT ----------------
+  socket.on("chat", (msg) => {
+    if (!socket.partnerId) return;
 
+    io.to(socket.partnerId).emit("chat", msg);
+  });
+
+  // ---------------- NEXT ----------------
+  socket.on("next", () => {
     if (socket.partnerId) {
       io.to(socket.partnerId).emit("partner_left");
     }
 
     socket.partnerId = null;
 
-    if (waitingUser && waitingUser.id === socket.id) {
-      waitingUser = null;
+    console.log("next:", socket.id);
+
+    if (waiting && waiting.id === socket.id) {
+      waiting = null;
     }
   });
 
-  // DISCONNECT
+  // ---------------- DISCONNECT ----------------
   socket.on("disconnect", () => {
     console.log("disconnect:", socket.id);
 
-    if (waitingUser && waitingUser.id === socket.id) {
-      waitingUser = null;
+    if (waiting && waiting.id === socket.id) {
+      waiting = null;
     }
 
     if (socket.partnerId) {
@@ -97,5 +107,5 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+  console.log("Server running on", PORT);
 });
