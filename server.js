@@ -60,10 +60,17 @@ async function startCamera() {
 
 function createPeer() {
   pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" }
-    ]
-  });
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+
+    // TURN (critical for speed + reliability)
+    {
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    }
+  ]
+});;
 
   // add tracks
   localStream.getTracks().forEach(track => {
