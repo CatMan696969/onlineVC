@@ -1,170 +1,90 @@
-const socket = io("https://onlinevc-925x.onrender.com");
-
-let pc;
-let localStream;
-
-const localVideo = document.getElementById("local");
-const remoteVideo = document.getElementById("remote");
-const messages = document.getElementById("messages");
-
-const chatBox = document.getElementById("chatBox");
-const chatBtn = document.getElementById("chatBtn");
-
-// ---------------- CHAT UI ----------------
-
-chatBtn.onclick = () => {
-  chatBox.style.display = chatBox.style.display === "flex" ? "none" : "flex";
+// 1. CONFIGURATION
+const RENDER_URL = "https://onlinevc-925x.onrender.com"; // Change to your Render URL
+const iceConfig = {
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    iceCandidatePoolSize: 10
 };
 
-function toggleChat() {
-  chatBox.style.display = "none";
-}
+let pc;
+let dataChannel;
 
-function addMsg(sender, text) {
-  const div = document.createElement("div");
-  div.textContent = sender + ": " + text;
-  messages.appendChild(div);
-  messages.scrollTop = messages.scrollHeight;
-}
-
-function sendMsg() {
-  const input = document.getElementById("msg");
-  const text = input.value.trim();
-  if (!text) return;
-
-  addMsg("You", text);
-  socket.emit("chat_message", { text });
-  input.value = "";
-}
-
-socket.on("chat_message", (data) => {
-  addMsg("Stranger", data.text);
-});
-
-// ---------------- CAMERA ----------------
-
-async function startCamera() {
-  localStream = await navigator.mediaDevices.getUserMedia({
-    video: true,
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    }
-  });
-
-  localVideo.srcObject = localStream;
-}
-
-// ---------------- WEBRTC ----------------
-
-function createPeer() {
-  pc = new RTCPeerConnection({
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-
-    // TURN (critical for speed + reliability)
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    }
-  ]
-});;
-
-  // add tracks
-  localStream.getTracks().forEach(track => {
-    pc.addTrack(track, localStream);
-  });
-
-  // receive stream
-  pc.ontrack = (e) => {
-    remoteVideo.srcObject = e.streams[0];
-  };
-
-  // FAST ICE (trickle ICE FIX)
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      socket.emit("signal", {
-        candidate: e.candidate
-      });
-    }
-  };
-
-  return pc;
-}
-
-// ---------------- SIGNALING ----------------
-
-socket.on("matched", async () => {
-  pc = createPeer();
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-
-  socket.emit("signal", {
-    description: pc.localDescription
-  });
-});
-
-socket.on("signal", async (data) => {
-  if (!pc) pc = createPeer();
-
-  // SDP handling
-  if (data.description) {
-    if (data.description.type === "offer") {
-      await pc.setRemoteDescription(data.description);
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      socket.emit("signal", {
-        description: pc.localDescription
-      });
-    }
-
-    if (data.description.type === "answer") {
-      await pc.setRemoteDescription(data.description);
-    }
-  }
-
-  // ICE handling (IMPORTANT FIX)
-  if (data.candidate) {
+// 2. THE WAKE-UP CALL (Fixes Render Free Tier 30s delay)
+async function wakeUpServer() {
     try {
-      await pc.addIceCandidate(data.candidate);
+        await fetch(`${RENDER_URL}/ping`);
+        console.log("Render server is awake!");
     } catch (e) {
-      console.log("ICE error:", e);
+        console.log("Waking server...");
     }
-  }
-});
+}
+wakeUpServer();
 
-// ---------------- CLEANUP ----------------
+// 3. THE CORE CONNECTION LOGIC
+async function startConnection(isInitiator) {
+    pc = new RTCPeerConnection(iceConfig);
 
-socket.on("partner_left", () => {
-  remoteVideo.srcObject = null;
+    // FIX: TRICKLE ICE (Removes the 40-second hang)
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            sendToSignaling({ type: 'candidate', candidate: event.candidate });
+        }
+    };
 
-  if (pc) {
-    pc.close();
-    pc = null;
-  }
-});
-
-// ---------------- BUTTONS ----------------
-
-async function start() {
-  await startCamera();
-  socket.emit("find");
+    if (isInitiator) {
+        // Device A creates the channel
+        dataChannel = pc.createDataChannel("chat");
+        setupDataChannelHandlers();
+        
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sendToSignaling({ type: 'offer', sdp: offer });
+    } else {
+        // Device B waits for the channel
+        pc.ondatachannel = (event) => {
+            dataChannel = event.channel;
+            setupDataChannelHandlers();
+        };
+    }
 }
 
-function next() {
-  socket.emit("next");
+// 4. HANDLING INCOMING SIGNALS (From Render/Socket.io)
+async function handleIncomingSignal(message) {
+    if (message.type === 'offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendToSignaling({ type: 'answer', sdp: answer });
+    } 
+    else if (message.type === 'answer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+    } 
+    else if (message.type === 'candidate') {
+        await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+    }
+}
 
-  if (pc) {
-    pc.close();
-    pc = null;
-  }
+// 5. STABILITY FIXES (Other Issues)
+function setupDataChannelHandlers() {
+    dataChannel.onopen = () => console.log("CONNECTED FAST!");
+    
+    // Heartbeat: Prevents Netlify/Render from killing the connection
+    setInterval(() => {
+        if (dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({ type: 'keep-alive' }));
+        }
+    }, 15000);
 
-  remoteVideo.srcObject = null;
+    dataChannel.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.type !== 'keep-alive') {
+            console.log("New Message:", data);
+        }
+    };
+}
 
-  socket.emit("find");
+// 6. SIGNALING BRIDGE
+// Replace this function with your actual Socket.io emit logic
+function sendToSignaling(data) {
+    // Example: socket.emit('message', data);
+    console.log("Sending signal:", data.type);
 }
