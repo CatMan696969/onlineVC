@@ -36,12 +36,12 @@ io.on("connection", (socket) => {
     }
   });
 
-  // WebRTC signaling (offer/answer/ICE)
+  // WebRTC signaling
   socket.on("signal", (data) => {
     socket.to(socket.room).emit("signal", data);
   });
 
-  // Next button (disconnect current partner)
+  // NEXT button
   socket.on("next", () => {
     if (socket.room) {
       socket.to(socket.room).emit("partner_left");
@@ -49,7 +49,16 @@ io.on("connection", (socket) => {
       socket.room = null;
     }
 
-    socket.emit("find"); // auto requeue
+    socket.emit("find");
+  });
+
+  // 💬 CHAT FEATURE (NEW)
+  socket.on("chat_message", (data) => {
+    if (!socket.room) return;
+
+    socket.to(socket.room).emit("chat_message", {
+      text: data.text
+    });
   });
 
   socket.on("disconnect", () => {
