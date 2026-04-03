@@ -17,37 +17,33 @@ const io = new Server(server, {
 
 // ---------------- DATA ----------------
 let waitingQueue = [];
-let usersByUsername = {}; // Name -> Socket ID mapping
+let usersByUsername = {}; // Name -> Socket ID
 
 // ---------------- CONNECTION ----------------
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
   socket.partnerId = null;
+  socket.meta = {};
 
   // ---------------- REGISTRATION ----------------
-  // This is called by the Dating Edition to make the user "searchable"
   socket.on("register_user", (username) => {
     socket.userName = username;
     usersByUsername[username] = socket.id;
-    console.log(`Registered: ${username} as ${socket.id}`);
+    console.log(`Registered: ${username}`);
   });
 
   // ---------------- FIND MATCH (RANDOM) ----------------
   socket.on("find", (meta) => {
     socket.meta = meta || {};
-    // Default to 'original' if no app type is specified
     socket.meta.app = socket.meta.app || "original"; 
 
-    console.log(`Find request from ${socket.id} for app: ${socket.meta.app}`);
+    // Remove from queue if they were already in it to prevent duplicates
+    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
 
-    // Logic: Only match users on the SAME app
     let matchIndex = waitingQueue.findIndex(other => {
       if (other.id === socket.id) return false;
-      
-      // 1. Must be the same app (Dating vs Original)
       if (other.meta.app !== socket.meta.app) return false;
 
-      // 2. Preference match (Gender logic)
       const prefA = socket.meta.preference;
       const prefB = other.meta.preference;
       const genderA = socket.meta.gender;
@@ -61,45 +57,44 @@ io.on("connection", (socket) => {
 
     if (matchIndex !== -1) {
       const partner = waitingQueue.splice(matchIndex, 1)[0];
-
       socket.partnerId = partner.id;
       partner.partnerId = socket.id;
 
       socket.emit("matched", { offerer: true, partner: partner.meta });
       partner.emit("matched", { offerer: false, partner: socket.meta });
     } else {
-      // Avoid double-adding to queue
-      if (!waitingQueue.find(s => s.id === socket.id)) {
-        waitingQueue.push(socket);
-      }
+      waitingQueue.push(socket);
     }
   });
 
-  // ---------------- CALL BY NAME (PRIVATE) ----------------
+  // ---------------- PRIVATE CALL HANDSHAKE ----------------
   socket.on("private_call_request", (data) => {
     const targetSocketId = usersByUsername[data.targetName];
-    
     if (targetSocketId && targetSocketId !== socket.id) {
       io.to(targetSocketId).emit("incoming_private_call", {
         senderName: data.senderName,
         callerId: socket.id
       });
     } else {
-      socket.emit("private_call_rejected", "User is offline or does not exist.");
+      socket.emit("private_call_rejected", "User is offline or not found.");
     }
   });
 
   socket.on("private_call_accepted", (data) => {
     const caller = io.sockets.sockets.get(data.callerId);
     if (caller) {
-      // Disconnect them from any current random matches first
-      if (socket.partnerId) io.to(socket.partnerId).emit("partner_left");
-      if (caller.partnerId) io.to(caller.partnerId).emit("partner_left");
+      // CLEAR OLD CONNECTIONS FOR BOTH
+      [socket, caller].forEach(s => {
+        if (s.partnerId) {
+          io.to(s.partnerId).emit("partner_left");
+          const oldPartner = io.sockets.sockets.get(s.partnerId);
+          if (oldPartner) oldPartner.partnerId = null;
+        }
+      });
 
       socket.partnerId = caller.id;
       caller.partnerId = socket.id;
 
-      // Bridge the WebRTC connection
       socket.emit("matched", { offerer: false, partner: caller.meta || { name: caller.userName } });
       caller.emit("matched", { offerer: true, partner: socket.meta || { name: socket.userName } });
     }
@@ -109,7 +104,7 @@ io.on("connection", (socket) => {
     io.to(data.callerId).emit("private_call_rejected", "User declined the call.");
   });
 
-  // ---------------- CORE SIGNALING ----------------
+  // ---------------- CORE LOGIC ----------------
   socket.on("signal", (data) => {
     if (socket.partnerId) io.to(socket.partnerId).emit("signal", data);
   });
@@ -122,7 +117,6 @@ io.on("connection", (socket) => {
     if (socket.partnerId) io.to(socket.partnerId).emit("typing", isTyping);
   });
 
-  // ---------------- CLEANUP ----------------
   const leave = () => {
     waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
     if (socket.partnerId) {
@@ -141,4 +135,4 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on ${PORT}`));
