@@ -5,58 +5,52 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
-
 const server = http.createServer(app);
-
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// ---------------- DATA ----------------
+// ---------------- STATE ----------------
 let waitingQueue = [];
-let usersByUsername = {}; // Name -> Socket ID
+let usersByUsername = {}; // { "Name": "SocketID" }
 
-// ---------------- CONNECTION ----------------
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log("Connected:", socket.id);
   socket.partnerId = null;
-  socket.meta = {};
+  socket.userName = null;
 
-  // ---------------- REGISTRATION ----------------
-  socket.on("register_user", (username) => {
-    socket.userName = username;
-    usersByUsername[username] = socket.id;
-    console.log(`Registered: ${username}`);
+  // 1. REGISTER (For Direct Calls)
+  socket.on("register_user", (name) => {
+    if (!name) return;
+    socket.userName = name;
+    usersByUsername[name] = socket.id;
+    console.log(`User ${name} registered.`);
   });
 
-  // ---------------- FIND MATCH (RANDOM) ----------------
+  // 2. RANDOM MATCHING
   socket.on("find", (meta) => {
     socket.meta = meta || {};
-    socket.meta.app = socket.meta.app || "original"; 
-
-    // Remove from queue if they were already in it to prevent duplicates
+    socket.meta.app = socket.meta.app || "original";
+    
+    // Clean up existing states
     waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
-
+    
     let matchIndex = waitingQueue.findIndex(other => {
       if (other.id === socket.id) return false;
       if (other.meta.app !== socket.meta.app) return false;
-
+      
+      // Gender Preference Logic
       const prefA = socket.meta.preference;
       const prefB = other.meta.preference;
-      const genderA = socket.meta.gender;
-      const genderB = other.meta.gender;
+      const genA = socket.meta.gender;
+      const genB = other.meta.gender;
 
-      const matchA = !prefA || prefA === genderB;
-      const matchB = !prefB || prefB === genderA;
-
-      return matchA && matchB;
+      return (!prefA || prefA === genB) && (!prefB || prefB === genA);
     });
 
     if (matchIndex !== -1) {
       const partner = waitingQueue.splice(matchIndex, 1)[0];
+      
       socket.partnerId = partner.id;
       partner.partnerId = socket.id;
 
@@ -67,44 +61,47 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ---------------- PRIVATE CALL HANDSHAKE ----------------
+  // 3. PRIVATE CALL LOGIC (The "Device A/B/C" Fix)
   socket.on("private_call_request", (data) => {
-    const targetSocketId = usersByUsername[data.targetName];
-    if (targetSocketId && targetSocketId !== socket.id) {
-      io.to(targetSocketId).emit("incoming_private_call", {
+    const targetId = usersByUsername[data.targetName];
+    if (targetId && targetId !== socket.id) {
+      io.to(targetId).emit("incoming_private_call", {
         senderName: data.senderName,
         callerId: socket.id
       });
     } else {
-      socket.emit("private_call_rejected", "User is offline or not found.");
+      socket.emit("private_call_rejected", "User is offline or busy.");
     }
   });
 
   socket.on("private_call_accepted", (data) => {
     const caller = io.sockets.sockets.get(data.callerId);
-    if (caller) {
-      // CLEAR OLD CONNECTIONS FOR BOTH
-      [socket, caller].forEach(s => {
-        if (s.partnerId) {
-          io.to(s.partnerId).emit("partner_left");
-          const oldPartner = io.sockets.sockets.get(s.partnerId);
-          if (oldPartner) oldPartner.partnerId = null;
-        }
-      });
+    if (!caller) return;
 
-      socket.partnerId = caller.id;
-      caller.partnerId = socket.id;
+    // --- SIGNALING ISOLATION ---
+    // Force disconnect anyone they are currently talking to
+    [socket, caller].forEach(s => {
+      if (s.partnerId) {
+        io.to(s.partnerId).emit("partner_left");
+        const oldPartner = io.sockets.sockets.get(s.partnerId);
+        if (oldPartner) oldPartner.partnerId = null;
+        s.partnerId = null; 
+      }
+    });
 
-      socket.emit("matched", { offerer: false, partner: caller.meta || { name: caller.userName } });
-      caller.emit("matched", { offerer: true, partner: socket.meta || { name: socket.userName } });
-    }
+    // Bridge the new pair
+    socket.partnerId = caller.id;
+    caller.partnerId = socket.id;
+
+    socket.emit("matched", { offerer: false, partner: caller.meta || { name: caller.userName } });
+    caller.emit("matched", { offerer: true, partner: socket.meta || { name: socket.userName } });
   });
 
   socket.on("private_call_declined", (data) => {
-    io.to(data.callerId).emit("private_call_rejected", "User declined the call.");
+    io.to(data.callerId).emit("private_call_rejected", "Call declined.");
   });
 
-  // ---------------- CORE LOGIC ----------------
+  // 4. WEBRTC SIGNALING & CHAT
   socket.on("signal", (data) => {
     if (socket.partnerId) io.to(socket.partnerId).emit("signal", data);
   });
@@ -113,26 +110,23 @@ io.on("connection", (socket) => {
     if (socket.partnerId) io.to(socket.partnerId).emit("chat", msg);
   });
 
-  socket.on("typing", (isTyping) => {
-    if (socket.partnerId) io.to(socket.partnerId).emit("typing", isTyping);
-  });
-
-  const leave = () => {
+  // 5. CLEANUP
+  const disconnectPair = () => {
     waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
     if (socket.partnerId) {
       io.to(socket.partnerId).emit("partner_left");
-      const partner = io.sockets.sockets.get(socket.partnerId);
-      if (partner) partner.partnerId = null;
+      const p = io.sockets.sockets.get(socket.partnerId);
+      if (p) p.partnerId = null;
     }
     socket.partnerId = null;
   };
 
-  socket.on("next", leave);
+  socket.on("next", disconnectPair);
   socket.on("disconnect", () => {
     if (socket.userName) delete usersByUsername[socket.userName];
-    leave();
+    disconnectPair();
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
